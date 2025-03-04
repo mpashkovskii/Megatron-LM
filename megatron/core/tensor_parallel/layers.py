@@ -455,7 +455,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             if wgrad_deferral_limit == 0 or len(grad_output_buffer) < wgrad_deferral_limit:
                 grad_output_buffer.append(grad_output)
                 wgrad_compute = False
-
+        
         if wgrad_compute:
             if ctx.sequence_parallel:
                 world_size = get_tensor_model_parallel_world_size()
@@ -486,6 +486,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
 
         if ctx.allreduce_dgrad:
             # Asynchronous all-reduce
+            print(f"{grad_input=}")
             handle = torch.distributed.all_reduce(
                 grad_input, group=get_tensor_model_parallel_group(), async_op=True
             )
@@ -553,6 +554,8 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         if ctx.allreduce_dgrad:
             handle.wait()
 
+        print(f"{grad_input=}")
+        print(f"{grad_weight=}")
         return grad_input, grad_weight, grad_bias, None, None, None, None, None
 
 
