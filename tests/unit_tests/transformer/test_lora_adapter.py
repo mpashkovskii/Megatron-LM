@@ -1,9 +1,18 @@
 # Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
+from functools import partial
+from typing import Any, Callable, Generator
+
 import pytest
 import torch
-from torch.optim import SGD
+from torch.optim import Adam, SGD
+import transformer_engine
 
+from megatron.core.extensions.transformer_engine import (
+    TEColumnParallelLinear,
+)
+from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.mappings import _gather_along_first_dim
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -13,16 +22,22 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
-@pytest.mark.parametrize(
-    "expert_tensor_parallel_size, pipeline_model_parallel_size, tensor_model_parallel_size, sequence_parallel",
-    [
-        (1, 1, 2, False),
-    ]
-)
+@pytest.mark.parametrize('pipeline_model_parallel_size', [1, 2])
+@pytest.mark.parametrize("expert_tensor_parallel_size, tensor_model_parallel_size, sequence_parallel", [
+    (1, 1, False),
+    (2, 1, False),
+    (1, 2, False),
+    (1, 2, True),
+    (2, 2, True),
+])
+@pytest.mark.parametrize("base_layer_constructor", [
+    partial(ColumnParallelLinear),
+    partial(TEColumnParallelLinear, gather_output=False, is_expert=False),
+])
 class TestLoraAdapterWithLoraLayers:
 
     @pytest.fixture(scope='function', autouse=True)
-    def setup_and_teardown(self, expert_tensor_parallel_size: int, pipeline_model_parallel_size: int, tensor_model_parallel_size: int, sequence_parallel: bool):
+    def setup_and_teardown(self, expert_tensor_parallel_size: int, pipeline_model_parallel_size: int, tensor_model_parallel_size: int, sequence_parallel: bool, base_layer_constructor: Callable) -> Generator[Any, Any, Any]:
         Utils.initialize_model_parallel(
             expert_tensor_parallel_size=expert_tensor_parallel_size,
             pipeline_model_parallel_size=pipeline_model_parallel_size,
@@ -45,7 +60,32 @@ class TestLoraAdapterWithLoraLayers:
             sequence_parallel=sequence_parallel,
             pipeline_dtype=torch.float32,
         )
-        base_layer = ColumnParallelLinear(
+        
+        # Why do we need to call Linear constructor to make tests work?
+        transformer_engine.pytorch.Linear(
+            in_features=1,
+            out_features=1,
+            sequence_parallel=sequence_parallel,
+            tp_size=tensor_model_parallel_size,
+
+            # get_rng_state_tracker=None  # BREAKS!
+            get_rng_state_tracker=(
+                get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
+            ),
+            
+            # # Probably not important params
+            # fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
+            # tp_group=get_tensor_model_parallel_group(check_initialized=False),
+            # init_method=None,
+            # bias=False,
+            # return_bias=False,
+            # parallel_mode=None,
+            # params_dtype=torch.float32,
+            # device=torch.cuda.current_device(),
+            # rng_tracker_name=None,
+        )
+
+        base_layer = base_layer_constructor(
             input_size=self.input_size,
             output_size=self.output_size,
             config=self.config,
@@ -63,7 +103,7 @@ class TestLoraAdapterWithLoraLayers:
         yield
         Utils.destroy_model_parallel()
 
-    def test_constructor(self):
+    def test_constructor(self) -> None:
         parallel_output_size = int(self.output_size / self.config.tensor_model_parallel_size)
         assert _get_nparams(self.lora_adapter) == self.input_size * parallel_output_size \
             + self.input_size * self.rank \
@@ -74,7 +114,7 @@ class TestLoraAdapterWithLoraLayers:
         assert self.lora_adapter.base_layer.weight.shape[INPUT_INDEX] == self.lora_adapter.lora_a.weight.shape[INPUT_INDEX]
         assert self.lora_adapter.base_layer.weight.shape[OUTPUT_INDEX] == self.lora_adapter.lora_b.weight.shape[OUTPUT_INDEX]
 
-    def test_load_state_dict(self):
+    def test_load_state_dict(self) -> None:
         model = torch.nn.Module()
         model.add_module("output_layer", self.lora_adapter)
         parallel_output_size = int(self.output_size / self.config.tensor_model_parallel_size)
@@ -87,64 +127,52 @@ class TestLoraAdapterWithLoraLayers:
         assert torch.any(self.lora_adapter.lora_a.weight)
         assert self.lora_adapter.lora_b.weight.sum() == 0
 
-    def test_forward(self):
+    # torchrun --nproc_per_node=2 -m pytest --color=yes -k test_forward tests/unit_tests/transformer/test_lora_adapter.py
+    @pytest.mark.parametrize("optimizer_constructor", [
+        # We have to use MegatronOptimizer sub classes instead of torch.optim.Optimizer
+        Adam,
+        # SGD,
+    ])
+    def test_forward(self, optimizer_constructor: torch.optim.Optimizer) -> None:
         batch_size = 1
-        input_data = torch.rand(batch_size, self.input_size).cuda()
-        print(f"INPUT: {input_data}\n")
+        # input_data = torch.rand(batch_size, self.input_size).cuda()  # WORKS UNSTABLE (FLAKY)! Why random values doesn't work?
+        val = torch.distributed.get_rank() + 1.
+        input_data = torch.full((batch_size, self.input_size), val).cuda()
 
-        def print_adapter(adapter: LoraAdapter) -> str:
-            return f"""
-  A:
-    weight = {adapter.lora_a.weight.data}
-    grad = {adapter.lora_a.weight.grad.data}
-
-  B:
-    weight = {adapter.lora_b.weight.data}
-    grad = {adapter.lora_b.weight.grad.data}
-
-"""
-
+        model = self.lora_adapter
+        layers_to_check = [
+            # "lora_a",
+            "lora_b",
+        ]
         original_weights = {
-            "lora_a": self.lora_adapter.lora_a.weight.clone().detach(),
-            "lora_b": self.lora_adapter.lora_b.weight.clone().detach(),
+            layer: getattr(model, layer).weight.clone().detach()
+            for layer in layers_to_check
         }
+        optimizer = optimizer_constructor(model.parameters())
         
         # https://stackoverflow.com/questions/54447084/how-to-properly-update-the-weights-in-pytorch
         # https://hmkcode.com/ai/backpropagation-step-by-step/
-        optimizer = SGD(self.lora_adapter.parameters())
-        print(list(self.lora_adapter.parameters()))
         for idx in range(2):
             optimizer.zero_grad()
-            # forward_backward_no_pipelining = get_forward_backward_func()
-            # See docs for `get_forward_backward_func`
-            # forward_backward_no_pipelining()
-            output, _ = self.lora_adapter(input_data)
+            output, _ = model(input_data)
             (1 - output.mean()).backward()
-            # backward_step()
-            # finalize_model_grads() ?
-            print(f"ITERATION {idx} -----------------------------------------------")
-            print(f"OUTPUT: {output.data}\n{print_adapter(self.lora_adapter)}")
             optimizer.step()
-        
-        print(f"FINAL:{print_adapter(self.lora_adapter)}")
 
-        assert self.lora_adapter.base_layer.weight.sum() == 0, "Base layer frozen weights were updated"
-        assert torch.all(self.lora_adapter.lora_b.weight), "LoRA B layer weights weren't updated"
+        assert model.base_layer.weight.sum() == 0, "Base layer frozen weights were updated"
+        assert torch.all(model.lora_b.weight), "LoRA B layer weights weren't updated"
         
-        for layer in [
-                # "lora_a",
-                "lora_b"
-        ]:
+        for layer in layers_to_check:
             original_weight = original_weights[layer]
-            current_local_weight = self.lora_adapter.__getattr__(layer).weight
+            current_local_weight = getattr(model, layer).weight
             assert not torch.allclose(original_weight, current_local_weight), f"Local weight wasn't updated for {layer}"
             
             full_weight = _gather_along_first_dim(current_local_weight)
-            print(f"FULL:\n  {full_weight.data}\n")
+            print(f"FINAL: {current_local_weight}")
+            print(f"FULL:  {full_weight.data}\n")
             for idx, weight in enumerate(torch.split(full_weight, current_local_weight.shape[0])):
                 assert torch.allclose(weight, current_local_weight), f"Weight on rank {idx} doesn't match for {layer}"
         
-        assert False, "DEBUG!"
+        # assert False, "DEBUG!"
 
 
 class TestLoraAdapterWithUnknownBaseLayer:
@@ -179,87 +207,55 @@ class TestLoraAdapterWithUnknownBaseLayer:
         assert _get_nparams(self.lora_adapter) == self.input_size * self.output_size
 
 
+# torchrun --nproc_per_node=2 -m pytest --color=yes -k test_Linear_classes tests/unit_tests/transformer/test_lora_adapter.py
+@pytest.mark.parametrize("constructor", [
+    # Linear,
+    partial(ColumnParallelLinear, gather_output=False),
+    # RowParallelLinear,
+])
+@pytest.mark.parametrize("tensor_model_parallel_size,sequence_parallel", [(2, False), (2, True)])
+@pytest.mark.parametrize("optimizer_constructor", [Adam, SGD])
+def test_Linear_classes(constructor: Callable, tensor_model_parallel_size: int, sequence_parallel: bool, optimizer_constructor: torch.optim.Optimizer) -> None: 
+    Utils.initialize_model_parallel(
+        expert_tensor_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        tensor_model_parallel_size=tensor_model_parallel_size,
+    )
+    model_parallel_cuda_manual_seed(123)
+
+    config = ModelParallelConfig(
+        expert_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        tensor_model_parallel_size=tensor_model_parallel_size,
+        sequence_parallel=sequence_parallel,
+    )
+    
+    batch_size = 1
+    input_size = 4
+    output_size = 8
+    input_data = torch.rand(batch_size, input_size).cuda()
+
+    model = constructor(
+        input_size=input_size,
+        output_size=output_size,
+        config=config,
+        init_method=torch.nn.init.ones_,
+        bias=False,
+        skip_bias_add=True,
+    )
+    original_weight = model.weight.clone().detach()
+
+    output, _ = model(input_data)
+    (1 - output.mean()).backward()
+    optimizer_constructor(model.parameters()).step()
+
+    full_weight = _gather_along_first_dim(model.weight)
+    assert not torch.allclose(original_weight, model.weight), "Local weight wasn't updated"
+    for idx, weight in enumerate(torch.split(full_weight, model.weight.shape[0])):
+        assert torch.allclose(weight, model.weight), f"Weight on rank {idx} doesn't match"
+    
+    Utils.destroy_model_parallel()
+
+
 def _get_nparams(module: torch.nn.Module):
     return sum([p.numel() for p in module.parameters()])
-
-
-
-# # Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
-
-# from functools import partial
-# from typing import Callable
-
-# import pytest
-# import torch
-# from torch.optim import Adam
-
-# from megatron.core.model_parallel_config import ModelParallelConfig
-# from megatron.core.tensor_parallel.layers import ColumnParallelLinear
-# from megatron.core.tensor_parallel.mappings import _gather_along_first_dim
-# from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-
-# from tests.unit_tests.test_utilities import Utils
-
-# # 
-# # Command to run that set of test:
-# #  torchrun --nproc_per_node=2 -m pytest --color=yes -k test_forward tests/unit_tests/transformer/test_lora_adapter.py
-# # 
-# @pytest.mark.parametrize("constructor", [
-#     # Linear,
-#     partial(ColumnParallelLinear, gather_output=False),
-#     # RowParallelLinear,
-# ])
-# @pytest.mark.parametrize("tensor_model_parallel_size,sequence_parallel", [(2, False), (2, True)])
-# def test_Linear_classes(constructor: Callable, tensor_model_parallel_size: int, sequence_parallel: bool):
-#     Utils.initialize_model_parallel(
-#         expert_tensor_parallel_size=1,
-#         pipeline_model_parallel_size=1,
-#         tensor_model_parallel_size=tensor_model_parallel_size,
-#     )
-#     model_parallel_cuda_manual_seed(123)
-
-#     config = ModelParallelConfig(
-#         expert_model_parallel_size=1,
-#         pipeline_model_parallel_size=1,
-#         tensor_model_parallel_size=tensor_model_parallel_size,
-#         sequence_parallel=sequence_parallel,
-#     )
-    
-#     batch_size = 1
-#     input_size = 4
-#     output_size = 8
-#     input_data = torch.rand(batch_size, input_size).cuda()
-
-#     model = constructor(
-#         input_size=input_size,
-#         output_size=output_size,
-#         config=config,
-#         init_method=torch.nn.init.ones_,
-#         bias=False,
-#         skip_bias_add=True,
-#     )
-#     original_weight = model.weight.clone().detach()
-
-#     output, _ = model(input_data)
-#     # Do we need to gather output? ColumnParallelLinear with gather_output=True does it already.
-#     # What about RowLinearParallel and Linear?
-#     # output = gather_from_tensor_model_parallel_region(output)
-
-#     # Following line crashes with:
-#     # - sequence_parallel: False
-#     #     FAILED tests/unit_tests/tensor_parallel/test_layers.py::test_Linear_classes[2-False-constructor0] - RuntimeError:
-#     #     Function LinearWithGradAccumulationAndAsyncCommunicationBackward returned an invalid gradient at index 1 - got []
-#     #     but expected shape compatible with [4, 4]
-#     # - sequence_parallel: True
-#     #     RuntimeError: mat1 and mat2 shapes cannot be multiplied (1x8 and 4x4)
-#     output.sum().backward()
-    
-#     optimizer = Adam(model.parameters(), lr=0.01)
-#     optimizer.step()
-
-#     full_weight = _gather_along_first_dim(model.weight)
-#     assert not torch.allclose(original_weight, model.weight), "Local weight wasn't updated"
-#     for idx, weight in enumerate(torch.split(full_weight, model.weight.shape[0])):
-#         assert torch.allclose(weight, model.weight), f"Weight on rank {idx} doesn't match"
-    
-#     Utils.destroy_model_parallel()
