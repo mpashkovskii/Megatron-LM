@@ -81,6 +81,9 @@ class LoraAdapter(MegatronModule):
             output_size *= config.tensor_model_parallel_size
         lora_a_class, lora_b_class = LORA_LAYERS_MAPPING[base_layer_class]
         self.lora_a = lora_a_class(input_size=input_size, output_size=rank, **layer_config)
+        with torch.no_grad():
+            if type(self.lora_a) is TELinear:
+                torch.distributed.broadcast(self.lora_a.weight, src=0)
         self.lora_b = lora_b_class(input_size=rank, output_size=output_size, **layer_config)
         self.lora_dropout = torch.nn.Dropout(p=dropout, inplace=False)
     
