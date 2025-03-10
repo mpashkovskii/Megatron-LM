@@ -10,6 +10,7 @@ import transformer_engine.pytorch as te
 
 from megatron.core.extensions.transformer_engine import (
     TEColumnParallelLinear,
+    TERowParallelLinear,
 )
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
@@ -21,30 +22,43 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
-@pytest.mark.parametrize('pipeline_model_parallel_size', [1, 2])
+@pytest.mark.parametrize('pipeline_model_parallel_size', [
+    1,
+    2,
+])
 @pytest.mark.parametrize(
     "expert_tensor_parallel_size, tensor_model_parallel_size, sequence_parallel",
     [
-        # ep=1
-        (1, 1, False),
-        (1, 2, False),
-        (1, 2, True), 
-
-        # ep=2
+        # tp=1, Can not use sequence paralllelism without tensor parallelism
+        (1, 1, False), 
         (2, 1, False),
-        (2, 2, True),  # sequence_parallel has to be on for EP+PP parallelizm
+
+        # tp=2
+        (1, 2, False),
+        (1, 2, True),
+        (2, 2, True),  # When using expert parallelism and tensor parallelism, sequence parallelism _must_ be used
     ]
 )
 @pytest.mark.parametrize("base_layer_constructor", [
     partial(ColumnParallelLinear),
-    # partial(RowParallelLinear),
-    partial(TEColumnParallelLinear, gather_output=False, is_expert=False),
-    # partial(TEColumnParallelLinear),
+    partial(TEColumnParallelLinear, gather_output=False),
+    # partial(RowParallelLinear, input_is_parallel=True),
+    # partial(TERowParallelLinear, input_is_parallel=True),
+])
+@pytest.mark.parametrize("is_expert", [
+    False,
+    True,
+# Sequence paralellism has to be off for is_expert=True?
+#   tests/unit_tests/transformer/test_lora_adapter.py::TestLoraAdapterWithLoraLayers::test_forward[True-base_layer_constructor0-1-2-True-2]
+#   /workspace/Megatron-LM/megatron/core/tensor_parallel/layers.py:837: UserWarning: `sequence_parallel` is set to `True`, but tensor model parallel size is 1. Disabling sequence parallel.
+#     warnings.warn(
+# FAILED tests/unit_tests/transformer/test_lora_adapter.py::TestLoraAdapterWithLoraLayers::test_forward[False-base_layer_constructor0-1-2-True-1] - AssertionError: Weight on rank 1 doesn't match for lora_a
+
 ])
 class TestLoraAdapterWithLoraLayers:
 
     @pytest.fixture(scope='function', autouse=True)
-    def setup_and_teardown(self, expert_tensor_parallel_size: int, pipeline_model_parallel_size: int, tensor_model_parallel_size: int, sequence_parallel: bool, base_layer_constructor: Callable) -> Generator[Any, Any, Any]:
+    def setup_and_teardown(self, expert_tensor_parallel_size: int, pipeline_model_parallel_size: int, tensor_model_parallel_size: int, sequence_parallel: bool, base_layer_constructor: Callable, is_expert: bool) -> Generator[Any, Any, Any]:
         Utils.initialize_model_parallel(
             expert_tensor_parallel_size=expert_tensor_parallel_size,
             pipeline_model_parallel_size=pipeline_model_parallel_size,
@@ -103,6 +117,7 @@ class TestLoraAdapterWithLoraLayers:
             bias=False,
             skip_bias_add=True,
             init_method=torch.nn.init.zeros_,
+            is_expert=is_expert,
         )
         self.lora_adapter = LoraAdapter(
             base_layer,
@@ -138,32 +153,44 @@ class TestLoraAdapterWithLoraLayers:
         assert torch.any(self.lora_adapter.lora_a.weight)
         assert self.lora_adapter.lora_b.weight.sum() == 0
 
-    # torchrun --nproc_per_node=2 -m pytest --color=yes -k test_forward tests/unit_tests/transformer/test_lora_adapter.py
-    @pytest.mark.parametrize("optimizer_constructor", [
-        # We have to use MegatronOptimizer sub classes instead of torch.optim.Optimizer
-        Adam,
-        # SGD,
-    ])
-    def test_forward(self, optimizer_constructor: torch.optim.Optimizer) -> None:
+    # Requires:
+    #   if ctx.parallel_mode is None and get_distributed_world_size(ctx.tp_group) > 1:
+    #       torch.distributed.all_reduce(wgrad, group=ctx.tp_group, op=torch.distributed.ReduceOp.AVG)
+    # in /opt/conda/envs/py_3.10/lib/python3.10/site-packages/transformer_engine/pytorch/module/linear.py:569
+    # 
+    # To run use:
+    #   CUDA_DEVICE_MAX_CONNECTIONS=1 torchrun --nproc_per_node=8 -m pytest --color=yes -k test_forward tests/unit_tests/transformer/test_lora_adapter.py
+    def test_forward(self) -> None:
         batch_size = 1
-        # val = torch.distributed.get_rank() + 1.
-        # input_data = torch.full((batch_size, self.input_size), val).cuda()
-        input_data = torch.rand(batch_size, self.input_size).cuda()  # WORKS UNSTABLE (FLAKY)! Why random values doesn't work?
+        input_data = torch.rand(batch_size, self.input_size).cuda()
 
         model = self.lora_adapter
-        layers_to_check = [
-            "lora_a",
-            "lora_b",
-        ]
+        
+        synced_layers = []
+        if type(self.lora_adapter.base_layer) in [ColumnParallelLinear, TEColumnParallelLinear]:
+            # TELinear has to be synced
+            synced_layers.append("lora_a")
+            if self.config.sequence_parallel:
+                # Column/Row parallel layers has be synced for sequence_parallel
+                synced_layers.append("lora_b")
+        
+        if type(self.lora_adapter.base_layer) in [RowParallelLinear, TERowParallelLinear]:
+            # TELinear has to be synced
+            synced_layers.append("lora_b")
+            if self.config.sequence_parallel:
+                # Column/Row parallel layers has be synced for sequence_parallel
+                synced_layers.append("lora_a")
+        
         original_weights = {
             layer: getattr(model, layer).weight.clone().detach()
-            for layer in layers_to_check
+            for layer in synced_layers
         }
-        optimizer = optimizer_constructor(model.parameters())
+        # optimizer = SGD(model.parameters())  # Causes fails! We have to use MegatronOptimizer sub classes instead of torch.optim.Optimizer
+        optimizer = Adam(model.parameters())  # We have to use MegatronOptimizer sub classes instead of torch.optim.Optimizer
         
-        # https://stackoverflow.com/questions/54447084/how-to-properly-update-the-weights-in-pytorch
-        # https://hmkcode.com/ai/backpropagation-step-by-step/
-        for idx in range(2):
+        # To propagate gradients through the zero-initialized weights we need at least two iterations.
+        # Let's do 100 to see any error accumulation.
+        for idx in range(100):
             optimizer.zero_grad()
             output, _ = model(input_data)
             (1 - output.mean()).backward()
@@ -172,7 +199,7 @@ class TestLoraAdapterWithLoraLayers:
         assert model.base_layer.weight.sum() == 0, "Base layer frozen weights were updated"
         assert torch.all(model.lora_b.weight), "LoRA B layer weights weren't updated"
         
-        for layer in layers_to_check:
+        for layer in synced_layers:
             original_weight = original_weights[layer]
             current_local_weight = getattr(model, layer).weight
             assert not torch.allclose(original_weight, current_local_weight), f"Local weight wasn't updated for {layer}"
@@ -182,8 +209,6 @@ class TestLoraAdapterWithLoraLayers:
             print(f"FULL:  {full_weight.data}\n")
             for idx, weight in enumerate(torch.split(full_weight, current_local_weight.shape[0])):
                 assert torch.allclose(weight, current_local_weight), f"Weight on rank {idx} doesn't match for {layer}"
-        
-        # assert False, "DEBUG!"
 
 
 class TestLoraAdapterWithUnknownBaseLayer:
