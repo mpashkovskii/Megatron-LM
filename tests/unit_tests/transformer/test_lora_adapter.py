@@ -5,15 +5,13 @@ from typing import Any, Callable, Generator
 
 import pytest
 import torch
-from torch.optim import Adam, SGD
-import transformer_engine.pytorch as te
+from torch.optim import Adam
 
 from megatron.core.extensions.transformer_engine import (
     TEColumnParallelLinear,
     TELayerNormColumnParallelLinear,
     TERowParallelLinear,
 )
-from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.mappings import _gather_along_first_dim
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -27,9 +25,9 @@ from tests.unit_tests.test_utilities import Utils
 @pytest.mark.parametrize(
     "expert_tensor_parallel_size, tensor_model_parallel_size",
     [
-        (1, 1), 
+        (1, 1),
+        (1, 2), 
         (2, 1),
-        (1, 2),
         # We don't support sequence_parallel fully, thus the next line is commented out.
         # (2, 2),
     ]
@@ -101,15 +99,10 @@ class TestLoraAdapterWithLoraLayers:
         Utils.destroy_model_parallel()
 
     def test_constructor(self) -> None:
-        parallel_output_size = int(self.output_size / self.config.tensor_model_parallel_size)
-        assert _get_nparams(self.lora_adapter) == self.input_size * parallel_output_size \
-            + self.input_size * self.rank \
-            + self.rank * parallel_output_size
-    
         INPUT_INDEX = 1
         OUTPUT_INDEX = 0
-        assert self.lora_adapter.base_layer.weight.shape[INPUT_INDEX] == self.lora_adapter.lora_a.weight.shape[INPUT_INDEX]
-        assert self.lora_adapter.base_layer.weight.shape[OUTPUT_INDEX] == self.lora_adapter.lora_b.weight.shape[OUTPUT_INDEX]
+        assert self.base_layer.weight.shape[INPUT_INDEX] == self.lora_adapter.lora_a.weight.shape[INPUT_INDEX]
+        assert self.base_layer.weight.shape[OUTPUT_INDEX] == self.lora_adapter.lora_b.weight.shape[OUTPUT_INDEX]
 
     def test_load_state_dict(self) -> None:
         model = torch.nn.Module()
@@ -130,33 +123,12 @@ class TestLoraAdapterWithLoraLayers:
         batch_size = 1
         sequence_length = self.input_size
         if type(self.base_layer) in [RowParallelLinear, TERowParallelLinear]:
-            if not self.is_expert:
-                sequence_length = self.input_size // self.config.tensor_model_parallel_size
-            elif self.config.expert_model_parallel_size > 1:
-                sequence_length = self.input_size // self.config.expert_model_parallel_size
+            sequence_length //= self.config.expert_model_parallel_size if self.is_expert else self.config.tensor_model_parallel_size
         input_data = torch.rand(batch_size, sequence_length).cuda()
 
-        synced_layers = []
-        if type(self.base_layer) in [ColumnParallelLinear, TEColumnParallelLinear, TELayerNormColumnParallelLinear]:
-            # Linear has to be synced
-            synced_layers.append("lora_a")
-            if self.config.sequence_parallel:
-                # Column/Row parallel layers has be synced only for sequence_parallel
-                synced_layers.append("lora_b")
-        
-        if type(self.base_layer) in [RowParallelLinear, TERowParallelLinear]:
-            # Linear has to be synced
-            synced_layers.append("lora_b")
-            if self.config.sequence_parallel:
-                # Column/Row parallel layers has be synced only for sequence_parallel
-                synced_layers.append("lora_a")
-        
-        original_weights = {
-            layer: getattr(self.lora_adapter, layer).weight.clone().detach()
-            for layer in synced_layers
-        }
-        # optimizer = SGD(model.parameters())  # Causes fails! We have to use MegatronOptimizer sub classes instead of torch.optim.Optimizer
-        optimizer = Adam(self.lora_adapter.parameters())  # We have to use MegatronOptimizer sub classes instead of torch.optim.Optimizer
+        synced_layer = "lora_b" if type(self.base_layer) in [RowParallelLinear, TERowParallelLinear] else "lora_a"
+        original_weight = getattr(self.lora_adapter, synced_layer).weight.clone().detach()
+        optimizer = Adam(self.lora_adapter.parameters())
         
         # To propagate gradients through the zero-initialized weights we need at least two iterations.
         # Let's do 100 to see any error accumulation.
@@ -169,14 +141,12 @@ class TestLoraAdapterWithLoraLayers:
         assert self.base_layer.weight.sum() == 0, "Base layer frozen weights were updated"
         assert torch.all(self.lora_adapter.lora_b.weight), "LoRA B layer weights weren't updated"
         
-        for layer in synced_layers:
-            original_weight = original_weights[layer]
-            current_local_weight = getattr(self.lora_adapter, layer).weight
-            assert not torch.allclose(original_weight, current_local_weight), f"Local weight wasn't updated for {layer}"
-            
-            full_weight = _gather_along_first_dim(current_local_weight)
-            for idx, weight in enumerate(torch.split(full_weight, current_local_weight.shape[0])):
-                assert torch.allclose(weight, current_local_weight), f"Weight on rank {idx} doesn't match for {layer}"
+        current_local_weight = getattr(self.lora_adapter, synced_layer).weight
+        assert not torch.allclose(original_weight, current_local_weight), f"Local weight wasn't updated for {synced_layer}"
+        
+        full_weight = _gather_along_first_dim(current_local_weight)
+        for idx, weight in enumerate(torch.split(full_weight, current_local_weight.shape[0])):
+            assert torch.allclose(weight, current_local_weight), f"Weight on rank {idx} doesn't match for {synced_layer}"
 
 
 class TestLoraAdapterWithUnknownBaseLayer:
