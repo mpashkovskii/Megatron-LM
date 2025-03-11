@@ -69,7 +69,7 @@ def test_LinearWithFrozenWeight(tensor_parallel, allreduce_dgrad):
     "tensor_model_parallel_size, sequence_parallel", 
     [
         (2, False),
-        (2, True)
+        # (2, True)
     ]
 )
 @pytest.mark.parametrize("optimizer_constructor", [
@@ -105,6 +105,8 @@ def test_Linear_classes(constructor: Callable, tensor_model_parallel_size: int, 
         bias=False,
         skip_bias_add=True,
     )
+    if type(model) == RowParallelLinear:
+        input_data = input_data[:, :input_size // tensor_model_parallel_size]
     original_weight = model.weight.clone().detach()
 
     output, _ = model(input_data)

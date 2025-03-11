@@ -25,7 +25,7 @@ from tests.unit_tests.test_utilities import Utils
 
 @pytest.mark.parametrize('pipeline_model_parallel_size', [
     1,
-    # 2,
+    2,
 ])
 @pytest.mark.parametrize(
     "expert_tensor_parallel_size, tensor_model_parallel_size, sequence_parallel",
@@ -39,29 +39,32 @@ from tests.unit_tests.test_utilities import Utils
         (1, 2, True),
         (2, 2, True),  # When using expert parallelism and tensor parallelism, sequence parallelism _must_ be used
 
-        # (1, 2, True),
+        # (1, 2, True),  # For column parallel
+        # (1, 2, False),  # For row parallel
     ]
 )
-@pytest.mark.parametrize("base_layer_constructor", [
+@pytest.mark.parametrize("base_layer", [
     partial(ColumnParallelLinear),
     partial(TEColumnParallelLinear, gather_output=False),
     partial(TELayerNormColumnParallelLinear, gather_output=False),
-    # partial(RowParallelLinear, input_is_parallel=True),
-    # partial(TERowParallelLinear, input_is_parallel=True),
+    partial(RowParallelLinear, input_is_parallel=True),
+    partial(TERowParallelLinear, input_is_parallel=True),
 ])
 @pytest.mark.parametrize("is_expert", [
     False,
+
+    # - Sequence paralellism has to be off for is_expert=True?
+    #     tests/unit_tests/transformer/test_lora_adapter.py::TestLoraAdapterWithLoraLayers::test_forward[True-base_layer_constructor0-1-2-True-2]
+    #     /workspace/Megatron-LM/megatron/core/tensor_parallel/layers.py:837: UserWarning: `sequence_parallel` is set to `True`, but tensor model parallel size is 1. Disabling sequence parallel.
+    #       warnings.warn(
+    #     FAILED tests/unit_tests/transformer/test_lora_adapter.py::TestLoraAdapterWithLoraLayers::test_forward[False-base_layer_constructor0-1-2-True-1] - AssertionError: Weight on rank 1 doesn't match for lora_a
+    # - 'Transformer Engine linear layers do not yet support MoE' in TELayerNormColumnParallelLinear
     # True,
-# Sequence paralellism has to be off for is_expert=True?
-#   tests/unit_tests/transformer/test_lora_adapter.py::TestLoraAdapterWithLoraLayers::test_forward[True-base_layer_constructor0-1-2-True-2]
-#   /workspace/Megatron-LM/megatron/core/tensor_parallel/layers.py:837: UserWarning: `sequence_parallel` is set to `True`, but tensor model parallel size is 1. Disabling sequence parallel.
-#     warnings.warn(
-# FAILED tests/unit_tests/transformer/test_lora_adapter.py::TestLoraAdapterWithLoraLayers::test_forward[False-base_layer_constructor0-1-2-True-1] - AssertionError: Weight on rank 1 doesn't match for lora_a
 ])
 class TestLoraAdapterWithLoraLayers:
 
     @pytest.fixture(scope='function', autouse=True)
-    def setup_and_teardown(self, expert_tensor_parallel_size: int, pipeline_model_parallel_size: int, tensor_model_parallel_size: int, sequence_parallel: bool, base_layer_constructor: Callable, is_expert: bool) -> Generator[Any, Any, Any]:
+    def setup_and_teardown(self, expert_tensor_parallel_size: int, pipeline_model_parallel_size: int, tensor_model_parallel_size: int, sequence_parallel: bool, base_layer: Callable, is_expert: bool) -> Generator[Any, Any, Any]:
         Utils.initialize_model_parallel(
             expert_tensor_parallel_size=expert_tensor_parallel_size,
             pipeline_model_parallel_size=pipeline_model_parallel_size,
@@ -87,33 +90,8 @@ class TestLoraAdapterWithLoraLayers:
             tensor_model_parallel_size=tensor_model_parallel_size,
             sequence_parallel=sequence_parallel,
         )
-        
-        # Why do we need to call Linear constructor to make tests work?
-        # Is it setup/teardown issue?
-        te.Linear(
-            in_features=1,
-            out_features=1,
-            sequence_parallel=sequence_parallel,
-            tp_size=tensor_model_parallel_size,
 
-            # get_rng_state_tracker=None  # BREAKS!
-            get_rng_state_tracker=(
-                get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
-            ),
-            
-            # # Probably not important params
-            # fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
-            # tp_group=get_tensor_model_parallel_group(check_initialized=False),
-            # init_method=None,
-            # bias=False,
-            # return_bias=False,
-            # parallel_mode=None,
-            # params_dtype=torch.float32,
-            # device=torch.cuda.current_device(),
-            # rng_tracker_name=None,
-        )
-
-        base_layer = base_layer_constructor(
+        base_layer = base_layer(
             input_size=self.input_size,
             output_size=self.output_size,
             config=self.config,
@@ -165,7 +143,12 @@ class TestLoraAdapterWithLoraLayers:
     #   CUDA_DEVICE_MAX_CONNECTIONS=1 torchrun --nproc_per_node=8 -m pytest --color=yes -k test_forward tests/unit_tests/transformer/test_lora_adapter.py
     def test_forward(self) -> None:
         batch_size = 1
-        input_data = torch.rand(batch_size, self.input_size).cuda()
+        sequence_length = (
+            self.input_size // self.config.tensor_model_parallel_size
+            if type(self.lora_adapter.base_layer) in [RowParallelLinear, TERowParallelLinear]
+            else self.input_size
+        )
+        input_data = torch.rand(batch_size, sequence_length).cuda()
 
         model = self.lora_adapter
         

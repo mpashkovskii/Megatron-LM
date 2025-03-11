@@ -35,7 +35,7 @@ COLUMN_PARALLEL_LAYERS = [
 ]
 ROW_PARALLEL_LAYERS = [
     partial(RowParallelLinear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=KAIMING_INIT_METHOD, input_is_parallel=True),
-    partial(TELinear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=torch.nn.init.zeros_, parallel_mode=None, skip_weight_param_allocation=False),
+    partial(SyncedLinear, init_method=torch.nn.init.zeros_),
 ]
 TE_COLUMN_PARALLEL_LAYERS = [
     partial(SyncedLinear, init_method=KAIMING_INIT_METHOD),
@@ -43,7 +43,7 @@ TE_COLUMN_PARALLEL_LAYERS = [
 ]
 TE_ROW_PARALLEL_LAYERS = [
     partial(TERowParallelLinear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=KAIMING_INIT_METHOD, input_is_parallel=True),
-    partial(TELinear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=torch.nn.init.zeros_, parallel_mode=None, skip_weight_param_allocation=False),
+    partial(SyncedLinear, init_method=torch.nn.init.zeros_),
 ]
 LORA_LAYERS_MAPPING = {
     ColumnParallelLinear: COLUMN_PARALLEL_LAYERS,
