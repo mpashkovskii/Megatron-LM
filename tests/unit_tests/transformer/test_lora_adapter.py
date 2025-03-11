@@ -30,21 +30,22 @@ from tests.unit_tests.test_utilities import Utils
 @pytest.mark.parametrize(
     "expert_tensor_parallel_size, tensor_model_parallel_size, sequence_parallel",
     [
-        # # tp=1, Can not use sequence paralllelism without tensor parallelism
-        # (1, 1, False), 
-        # (2, 1, False),
+        # tp=1, Can not use sequence paralllelism without tensor parallelism
+        (1, 1, False), 
+        (2, 1, False),
 
-        # # tp=2
-        # (1, 2, False),
-        # (1, 2, True),
-        # (2, 2, True),  # When using expert parallelism and tensor parallelism, sequence parallelism _must_ be used
-
+        # tp=2
+        (1, 2, False),
         (1, 2, True),
+        (2, 2, True),  # When using expert parallelism and tensor parallelism, sequence parallelism _must_ be used
+
+        # (1, 2, True),
     ]
 )
 @pytest.mark.parametrize("base_layer_constructor", [
     partial(ColumnParallelLinear),
-    # partial(TEColumnParallelLinear, gather_output=False),
+    partial(TEColumnParallelLinear, gather_output=False),
+    partial(TELayerNormColumnParallelLinear, gather_output=False),
     # partial(RowParallelLinear, input_is_parallel=True),
     # partial(TERowParallelLinear, input_is_parallel=True),
 ])
@@ -67,8 +68,8 @@ class TestLoraAdapterWithLoraLayers:
             tensor_model_parallel_size=tensor_model_parallel_size,
         )
         model_parallel_cuda_manual_seed(123)
-        self.input_size = 2
-        self.output_size = 2
+        self.input_size = 4
+        self.output_size = 8
         self.rank = 2
         self.alpha = 32
         self.config = TransformerConfig(
@@ -212,8 +213,6 @@ class TestLoraAdapterWithLoraLayers:
             print(f"FULL: {full_weight.data}\n")
             for idx, weight in enumerate(torch.split(full_weight, current_local_weight.shape[0])):
                 assert torch.allclose(weight, current_local_weight), f"Weight on rank {idx} doesn't match for {layer}"
-        
-        # assert False, "Test is not implemented yet"
 
 
 class TestLoraAdapterWithUnknownBaseLayer:
