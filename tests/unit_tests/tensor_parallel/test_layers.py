@@ -62,8 +62,8 @@ def test_LinearWithFrozenWeight(tensor_parallel, allreduce_dgrad):
 
 # torchrun --nproc_per_node=8 -m pytest --color=yes -k test_Linear_classes tests/unit_tests/tensor_parallel/test_layers.py
 @pytest.mark.parametrize("constructor", [
-    partial(ColumnParallelLinear, gather_output=False),
-    # partial(RowParallelLinear, input_is_parallel=???),
+    # partial(ColumnParallelLinear, gather_output=False),
+    partial(RowParallelLinear, input_is_parallel=True),
 ])
 @pytest.mark.parametrize(
     "tensor_model_parallel_size, sequence_parallel", 

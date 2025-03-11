@@ -30,7 +30,8 @@ LORA_LAYERS_DEFAULT_CONFIG = {
     "skip_bias_add": True,
 }
 COLUMN_PARALLEL_LAYERS = [
-    partial(SyncedLinear, init_method=KAIMING_INIT_METHOD),
+    partial(TELinear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=KAIMING_INIT_METHOD, parallel_mode=None, skip_weight_param_allocation=False),
+    # partial(SyncedLinear, init_method=KAIMING_INIT_METHOD),
     partial(ColumnParallelLinear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=torch.nn.init.zeros_),
 ]
 ROW_PARALLEL_LAYERS = [
@@ -38,7 +39,8 @@ ROW_PARALLEL_LAYERS = [
     partial(TELinear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=torch.nn.init.zeros_, parallel_mode=None, skip_weight_param_allocation=False),
 ]
 TE_COLUMN_PARALLEL_LAYERS = [
-    partial(SyncedLinear, init_method=KAIMING_INIT_METHOD),
+    partial(TELinear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=KAIMING_INIT_METHOD, parallel_mode=None, skip_weight_param_allocation=False),
+    # partial(SyncedLinear, init_method=KAIMING_INIT_METHOD),
     partial(TEColumnParallelLinear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=torch.nn.init.zeros_, gather_output=False),
 ]
 TE_ROW_PARALLEL_LAYERS = [
@@ -82,9 +84,24 @@ class LoraAdapter(MegatronModule):
             output_size *= config.tensor_model_parallel_size
         lora_a_class, lora_b_class = LORA_LAYERS_MAPPING[base_layer_class]
         self.lora_a = lora_a_class(input_size=input_size, output_size=rank, **layer_config)
+        if type(self.lora_a) is TELinear:
+            with torch.no_grad():
+                torch.distributed.broadcast(self.lora_a.weight, src=0)
         self.lora_b = lora_b_class(input_size=rank, output_size=output_size, **layer_config)
         self.lora_dropout = torch.nn.Dropout(p=dropout, inplace=False)
-    
+
+        for lora_layer in [self.lora_a, self.lora_b]:
+            if type(lora_layer) is TELinear:
+                # lora_layer.register_backward_hook(self._sync_linear_grad_hook)
+                lora_layer.register_full_backward_hook(self._sync_linear_grad, prepend=True)
+
+    def _sync_linear_grad(self, module: torch.nn.Module, grad_input: Tuple[torch.Tensor], grad_output: Tuple[torch.Tensor]) -> None:
+        # for `register_full_backward_hook`:
+        torch.distributed.all_reduce(grad_output[0], op=torch.distributed.ReduceOp.SUM)
+
+        # for `register_backward_hook`:
+        # torch.distributed.all_reduce(grad_input[0], op=torch.distributed.ReduceOp.SUM)
+
     def _remap_base_layer_for_training(self, _: torch.nn.Module, state_dict: dict, prefix: str, *args) -> None:
         extra_prefix = "base_layer."
         keys = list(state_dict.keys())

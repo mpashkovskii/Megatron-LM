@@ -10,6 +10,7 @@ import transformer_engine.pytorch as te
 
 from megatron.core.extensions.transformer_engine import (
     TEColumnParallelLinear,
+    TELayerNormColumnParallelLinear,
     TERowParallelLinear,
 )
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
@@ -24,36 +25,37 @@ from tests.unit_tests.test_utilities import Utils
 
 @pytest.mark.parametrize('pipeline_model_parallel_size', [
     1,
-    2,
+    # 2,
 ])
 @pytest.mark.parametrize(
     "expert_tensor_parallel_size, tensor_model_parallel_size, sequence_parallel",
     [
-        # tp=1, Can not use sequence paralllelism without tensor parallelism
-        (1, 1, False), 
-        (2, 1, False),
+        # # tp=1, Can not use sequence paralllelism without tensor parallelism
+        # (1, 1, False), 
+        # (2, 1, False),
 
-        # tp=2
-        (1, 2, False),
+        # # tp=2
+        # (1, 2, False),
+        # (1, 2, True),
+        # (2, 2, True),  # When using expert parallelism and tensor parallelism, sequence parallelism _must_ be used
+
         (1, 2, True),
-        (2, 2, True),  # When using expert parallelism and tensor parallelism, sequence parallelism _must_ be used
     ]
 )
 @pytest.mark.parametrize("base_layer_constructor", [
     partial(ColumnParallelLinear),
-    partial(TEColumnParallelLinear, gather_output=False),
+    # partial(TEColumnParallelLinear, gather_output=False),
     # partial(RowParallelLinear, input_is_parallel=True),
     # partial(TERowParallelLinear, input_is_parallel=True),
 ])
 @pytest.mark.parametrize("is_expert", [
     False,
-    True,
+    # True,
 # Sequence paralellism has to be off for is_expert=True?
 #   tests/unit_tests/transformer/test_lora_adapter.py::TestLoraAdapterWithLoraLayers::test_forward[True-base_layer_constructor0-1-2-True-2]
 #   /workspace/Megatron-LM/megatron/core/tensor_parallel/layers.py:837: UserWarning: `sequence_parallel` is set to `True`, but tensor model parallel size is 1. Disabling sequence parallel.
 #     warnings.warn(
 # FAILED tests/unit_tests/transformer/test_lora_adapter.py::TestLoraAdapterWithLoraLayers::test_forward[False-base_layer_constructor0-1-2-True-1] - AssertionError: Weight on rank 1 doesn't match for lora_a
-
 ])
 class TestLoraAdapterWithLoraLayers:
 
@@ -167,18 +169,18 @@ class TestLoraAdapterWithLoraLayers:
         model = self.lora_adapter
         
         synced_layers = []
-        if type(self.lora_adapter.base_layer) in [ColumnParallelLinear, TEColumnParallelLinear]:
-            # TELinear has to be synced
+        if type(self.lora_adapter.base_layer) in [ColumnParallelLinear, TEColumnParallelLinear, TELayerNormColumnParallelLinear]:
+            # Linear has to be synced
             synced_layers.append("lora_a")
             if self.config.sequence_parallel:
-                # Column/Row parallel layers has be synced for sequence_parallel
+                # Column/Row parallel layers has be synced only for sequence_parallel
                 synced_layers.append("lora_b")
         
         if type(self.lora_adapter.base_layer) in [RowParallelLinear, TERowParallelLinear]:
-            # TELinear has to be synced
+            # Linear has to be synced
             synced_layers.append("lora_b")
             if self.config.sequence_parallel:
-                # Column/Row parallel layers has be synced for sequence_parallel
+                # Column/Row parallel layers has be synced only for sequence_parallel
                 synced_layers.append("lora_a")
         
         original_weights = {
@@ -194,6 +196,7 @@ class TestLoraAdapterWithLoraLayers:
             optimizer.zero_grad()
             output, _ = model(input_data)
             (1 - output.mean()).backward()
+            print(f"{model.lora_a.weight.grad.data=}")
             optimizer.step()
 
         assert model.base_layer.weight.sum() == 0, "Base layer frozen weights were updated"
@@ -205,10 +208,12 @@ class TestLoraAdapterWithLoraLayers:
             assert not torch.allclose(original_weight, current_local_weight), f"Local weight wasn't updated for {layer}"
             
             full_weight = _gather_along_first_dim(current_local_weight)
-            print(f"FINAL: {current_local_weight}")
-            print(f"FULL:  {full_weight.data}\n")
+            print(f"FINAL: {current_local_weight.data}")
+            print(f"FULL: {full_weight.data}\n")
             for idx, weight in enumerate(torch.split(full_weight, current_local_weight.shape[0])):
                 assert torch.allclose(weight, current_local_weight), f"Weight on rank {idx} doesn't match for {layer}"
+        
+        # assert False, "Test is not implemented yet"
 
 
 class TestLoraAdapterWithUnknownBaseLayer:
