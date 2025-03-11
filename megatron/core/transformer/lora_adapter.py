@@ -57,6 +57,10 @@ LORA_LAYERS_MAPPING = {
 class LoraAdapter(MegatronModule):
     def __init__(self, base_layer: torch.nn.Module, *, config: TransformerConfig, rank: int, alpha: float, dropout: float, is_expert: bool = False):
         super(LoraAdapter, self).__init__(config)
+
+        if config.sequence_parallel and torch.distributed.get_rank() == 0:
+            LOGGER.warning("Sequence parallelism is not fully supported and may slow down the training. Use it at your own risk.")
+
         self.lora_alpha = alpha
         self.base_layer = base_layer
         self.base_layer.weight.requires_grad = False

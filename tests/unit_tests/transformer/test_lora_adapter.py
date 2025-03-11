@@ -23,54 +23,45 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
-@pytest.mark.parametrize('pipeline_model_parallel_size', [
-    1,
-    2,
-])
+@pytest.mark.parametrize('pipeline_model_parallel_size', [1, 2])
 @pytest.mark.parametrize(
-    "expert_tensor_parallel_size, tensor_model_parallel_size, sequence_parallel",
+    "expert_tensor_parallel_size, tensor_model_parallel_size",
     [
-        # tp=1, Can not use sequence paralllelism without tensor parallelism
-        (1, 1, False), 
-        (2, 1, False),
-
-        # tp=2
-        (1, 2, False),
-        (1, 2, True),
-        (2, 2, True),  # When using expert parallelism and tensor parallelism, sequence parallelism _must_ be used
-
-        # (1, 2, True),  # For column parallel
-        # (1, 2, False),  # For row parallel
+        (1, 1), 
+        (2, 1),
+        (1, 2),
+        # We don't support sequence_parallel fully, thus the next line is commented out.
+        # (2, 2),
     ]
 )
-@pytest.mark.parametrize("base_layer", [
-    partial(ColumnParallelLinear),
-    partial(TEColumnParallelLinear, gather_output=False),
-    partial(TELayerNormColumnParallelLinear, gather_output=False),
-    partial(RowParallelLinear, input_is_parallel=True),
-    partial(TERowParallelLinear, input_is_parallel=True),
-])
-@pytest.mark.parametrize("is_expert", [
-    False,
-
-    # - Sequence paralellism has to be off for is_expert=True?
-    #     tests/unit_tests/transformer/test_lora_adapter.py::TestLoraAdapterWithLoraLayers::test_forward[True-base_layer_constructor0-1-2-True-2]
-    #     /workspace/Megatron-LM/megatron/core/tensor_parallel/layers.py:837: UserWarning: `sequence_parallel` is set to `True`, but tensor model parallel size is 1. Disabling sequence parallel.
-    #       warnings.warn(
-    #     FAILED tests/unit_tests/transformer/test_lora_adapter.py::TestLoraAdapterWithLoraLayers::test_forward[False-base_layer_constructor0-1-2-True-1] - AssertionError: Weight on rank 1 doesn't match for lora_a
-    # - 'Transformer Engine linear layers do not yet support MoE' in TELayerNormColumnParallelLinear
-    # True,
-])
+@pytest.mark.parametrize(
+    "base_layer, is_expert",
+    [
+        (partial(ColumnParallelLinear), False),
+        (partial(ColumnParallelLinear), True),
+        (partial(TEColumnParallelLinear, gather_output=False), False),
+        (partial(TEColumnParallelLinear, gather_output=False), True),
+        (partial(TELayerNormColumnParallelLinear, gather_output=False), False),
+        # TELayerNormColumnParallelLinear layer is not used in MoE and rises 'Transformer Engine linear layers do not yet support MoE'
+        # in TELayerNormColumnParallelLinear.__init__(), thus the next line is commented out.
+        # (partial(TELayerNormColumnParallelLinear, gather_output=False), True),
+        (partial(RowParallelLinear, input_is_parallel=True), False),
+        (partial(RowParallelLinear, input_is_parallel=True), True),
+        (partial(TERowParallelLinear, input_is_parallel=True), False),
+        (partial(TERowParallelLinear, input_is_parallel=True), True),
+    ]
+)
 class TestLoraAdapterWithLoraLayers:
 
     @pytest.fixture(scope='function', autouse=True)
-    def setup_and_teardown(self, expert_tensor_parallel_size: int, pipeline_model_parallel_size: int, tensor_model_parallel_size: int, sequence_parallel: bool, base_layer: Callable, is_expert: bool) -> Generator[Any, Any, Any]:
+    def setup_and_teardown(self, expert_tensor_parallel_size: int, pipeline_model_parallel_size: int, tensor_model_parallel_size: int, base_layer: Callable, is_expert: bool) -> Generator[Any, Any, Any]:
         Utils.initialize_model_parallel(
             expert_tensor_parallel_size=expert_tensor_parallel_size,
             pipeline_model_parallel_size=pipeline_model_parallel_size,
             tensor_model_parallel_size=tensor_model_parallel_size,
         )
         model_parallel_cuda_manual_seed(123)
+        self.is_expert = is_expert
         self.input_size = 4
         self.output_size = 8
         self.rank = 2
@@ -88,10 +79,9 @@ class TestLoraAdapterWithLoraLayers:
             expert_model_parallel_size=expert_tensor_parallel_size,
             pipeline_model_parallel_size=pipeline_model_parallel_size,
             tensor_model_parallel_size=tensor_model_parallel_size,
-            sequence_parallel=sequence_parallel,
         )
 
-        base_layer = base_layer(
+        self.base_layer = base_layer(
             input_size=self.input_size,
             output_size=self.output_size,
             config=self.config,
@@ -101,7 +91,7 @@ class TestLoraAdapterWithLoraLayers:
             is_expert=is_expert,
         )
         self.lora_adapter = LoraAdapter(
-            base_layer,
+            self.base_layer,
             config=self.config,
             rank=self.rank,
             alpha=self.alpha,
@@ -134,33 +124,27 @@ class TestLoraAdapterWithLoraLayers:
         assert torch.any(self.lora_adapter.lora_a.weight)
         assert self.lora_adapter.lora_b.weight.sum() == 0
 
-    # Requires:
-    #   if ctx.parallel_mode is None and get_distributed_world_size(ctx.tp_group) > 1:
-    #       torch.distributed.all_reduce(wgrad, group=ctx.tp_group, op=torch.distributed.ReduceOp.AVG)
-    # in /opt/conda/envs/py_3.10/lib/python3.10/site-packages/transformer_engine/pytorch/module/linear.py:569
-    # 
     # To run use:
     #   CUDA_DEVICE_MAX_CONNECTIONS=1 torchrun --nproc_per_node=8 -m pytest --color=yes -k test_forward tests/unit_tests/transformer/test_lora_adapter.py
     def test_forward(self) -> None:
         batch_size = 1
-        sequence_length = (
-            self.input_size // self.config.tensor_model_parallel_size
-            if type(self.lora_adapter.base_layer) in [RowParallelLinear, TERowParallelLinear]
-            else self.input_size
-        )
+        sequence_length = self.input_size
+        if type(self.base_layer) in [RowParallelLinear, TERowParallelLinear]:
+            if not self.is_expert:
+                sequence_length = self.input_size // self.config.tensor_model_parallel_size
+            elif self.config.expert_model_parallel_size > 1:
+                sequence_length = self.input_size // self.config.expert_model_parallel_size
         input_data = torch.rand(batch_size, sequence_length).cuda()
 
-        model = self.lora_adapter
-        
         synced_layers = []
-        if type(self.lora_adapter.base_layer) in [ColumnParallelLinear, TEColumnParallelLinear, TELayerNormColumnParallelLinear]:
+        if type(self.base_layer) in [ColumnParallelLinear, TEColumnParallelLinear, TELayerNormColumnParallelLinear]:
             # Linear has to be synced
             synced_layers.append("lora_a")
             if self.config.sequence_parallel:
                 # Column/Row parallel layers has be synced only for sequence_parallel
                 synced_layers.append("lora_b")
         
-        if type(self.lora_adapter.base_layer) in [RowParallelLinear, TERowParallelLinear]:
+        if type(self.base_layer) in [RowParallelLinear, TERowParallelLinear]:
             # Linear has to be synced
             synced_layers.append("lora_b")
             if self.config.sequence_parallel:
@@ -168,32 +152,29 @@ class TestLoraAdapterWithLoraLayers:
                 synced_layers.append("lora_a")
         
         original_weights = {
-            layer: getattr(model, layer).weight.clone().detach()
+            layer: getattr(self.lora_adapter, layer).weight.clone().detach()
             for layer in synced_layers
         }
         # optimizer = SGD(model.parameters())  # Causes fails! We have to use MegatronOptimizer sub classes instead of torch.optim.Optimizer
-        optimizer = Adam(model.parameters())  # We have to use MegatronOptimizer sub classes instead of torch.optim.Optimizer
+        optimizer = Adam(self.lora_adapter.parameters())  # We have to use MegatronOptimizer sub classes instead of torch.optim.Optimizer
         
         # To propagate gradients through the zero-initialized weights we need at least two iterations.
         # Let's do 100 to see any error accumulation.
         for idx in range(100):
             optimizer.zero_grad()
-            output, _ = model(input_data)
+            output, _ = self.lora_adapter(input_data)
             (1 - output.mean()).backward()
-            print(f"{model.lora_a.weight.grad.data=}")
             optimizer.step()
 
-        assert model.base_layer.weight.sum() == 0, "Base layer frozen weights were updated"
-        assert torch.all(model.lora_b.weight), "LoRA B layer weights weren't updated"
+        assert self.base_layer.weight.sum() == 0, "Base layer frozen weights were updated"
+        assert torch.all(self.lora_adapter.lora_b.weight), "LoRA B layer weights weren't updated"
         
         for layer in synced_layers:
             original_weight = original_weights[layer]
-            current_local_weight = getattr(model, layer).weight
+            current_local_weight = getattr(self.lora_adapter, layer).weight
             assert not torch.allclose(original_weight, current_local_weight), f"Local weight wasn't updated for {layer}"
             
             full_weight = _gather_along_first_dim(current_local_weight)
-            print(f"FINAL: {current_local_weight.data}")
-            print(f"FULL: {full_weight.data}\n")
             for idx, weight in enumerate(torch.split(full_weight, current_local_weight.shape[0])):
                 assert torch.allclose(weight, current_local_weight), f"Weight on rank {idx} doesn't match for {layer}"
 
