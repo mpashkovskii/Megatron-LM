@@ -11,7 +11,6 @@ import torch
 from megatron.core.extensions.transformer_engine import (
     TEColumnParallelLinear,
     TELayerNormColumnParallelLinear,
-    TELinear,
     TERowParallelLinear,
 )
 from megatron.core.tensor_parallel import (
@@ -35,7 +34,7 @@ COLUMN_PARALLEL_LAYERS = [
 ]
 ROW_PARALLEL_LAYERS = [
     partial(RowParallelLinear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=KAIMING_INIT_METHOD, input_is_parallel=True),
-    partial(SyncedLinear, init_method=torch.nn.init.zeros_),
+    partial(SyncedLinear, init_method=torch.nn.init.zeros_, broadcast_weights=False),
 ]
 TE_COLUMN_PARALLEL_LAYERS = [
     partial(SyncedLinear, init_method=KAIMING_INIT_METHOD),
@@ -43,7 +42,7 @@ TE_COLUMN_PARALLEL_LAYERS = [
 ]
 TE_ROW_PARALLEL_LAYERS = [
     partial(TERowParallelLinear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=KAIMING_INIT_METHOD, input_is_parallel=True),
-    partial(SyncedLinear, init_method=torch.nn.init.zeros_),
+    partial(SyncedLinear, init_method=torch.nn.init.zeros_, broadcast_weights=False),
 ]
 LORA_LAYERS_MAPPING = {
     ColumnParallelLinear: COLUMN_PARALLEL_LAYERS,

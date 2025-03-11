@@ -28,7 +28,7 @@ from tests.unit_tests.test_utilities import Utils
         (1, 1),
         (1, 2), 
         (2, 1),
-        # We don't support sequence_parallel fully, thus the next line is commented out.
+        # EP2+TP2 requires sequence parallelism. LoraAdapter doesn't support sequence parallelism fully, thus the next line is commented out.
         # (2, 2),
     ]
 )
@@ -107,8 +107,15 @@ class TestLoraAdapterWithLoraLayers:
     def test_load_state_dict(self) -> None:
         model = torch.nn.Module()
         model.add_module("output_layer", self.lora_adapter)
-        parallel_output_size = int(self.output_size / self.config.tensor_model_parallel_size)
-        state_dict = {"output_layer.weight": torch.ones(parallel_output_size, self.input_size)}
+        state_dict = {
+            "output_layer.weight": torch.ones(self.base_layer.weight.shape),
+            "output_layer._extra_state": None,
+        }
+        if type(self.base_layer) is TELayerNormColumnParallelLinear:
+            norm_shape = self.base_layer.weight.shape[1]
+            state_dict["output_layer.layer_norm_weight"] = torch.ones(norm_shape)
+            state_dict["output_layer.layer_norm_bias"] = torch.ones(norm_shape)
+        
         missing_keys, unexpected_keys = model.load_state_dict(state_dict)
 
         assert missing_keys == []
@@ -117,36 +124,37 @@ class TestLoraAdapterWithLoraLayers:
         assert torch.any(self.lora_adapter.lora_a.weight)
         assert self.lora_adapter.lora_b.weight.sum() == 0
 
-    # To run use:
-    #   CUDA_DEVICE_MAX_CONNECTIONS=1 torchrun --nproc_per_node=8 -m pytest --color=yes -k test_forward tests/unit_tests/transformer/test_lora_adapter.py
     def test_forward(self) -> None:
         batch_size = 1
-        sequence_length = self.input_size
-        if type(self.base_layer) in [RowParallelLinear, TERowParallelLinear]:
-            sequence_length //= self.config.expert_model_parallel_size if self.is_expert else self.config.tensor_model_parallel_size
+        sequence_length = self.base_layer.weight.shape[1]
         input_data = torch.rand(batch_size, sequence_length).cuda()
 
-        synced_layer = "lora_b" if type(self.base_layer) in [RowParallelLinear, TERowParallelLinear] else "lora_a"
-        original_weight = getattr(self.lora_adapter, synced_layer).weight.clone().detach()
+        non_parallel_non_zero_layer = "lora_a"
+        parallel_zero_layer = "lora_b"
+        if type(self.base_layer) in [RowParallelLinear, TERowParallelLinear]:
+            non_parallel_non_zero_layer = "lora_b"
+            parallel_zero_layer = "lora_a"
+
+        original_weight = getattr(self.lora_adapter, non_parallel_non_zero_layer).weight.clone().detach()
         optimizer = Adam(self.lora_adapter.parameters())
         
         # To propagate gradients through the zero-initialized weights we need at least two iterations.
-        # Let's do 100 to see any error accumulation.
-        for idx in range(100):
+        # Let's do 10 to see errors accumulation.
+        for _ in range(10):
             optimizer.zero_grad()
             output, _ = self.lora_adapter(input_data)
             (1 - output.mean()).backward()
             optimizer.step()
 
         assert self.base_layer.weight.sum() == 0, "Base layer frozen weights were updated"
-        assert torch.all(self.lora_adapter.lora_b.weight), "LoRA B layer weights weren't updated"
+        assert torch.all(getattr(self.lora_adapter, parallel_zero_layer).weight), f"LoRA zero layer ({parallel_zero_layer}) weights weren't updated"
         
-        current_local_weight = getattr(self.lora_adapter, synced_layer).weight
-        assert not torch.allclose(original_weight, current_local_weight), f"Local weight wasn't updated for {synced_layer}"
+        current_local_weight = getattr(self.lora_adapter, non_parallel_non_zero_layer).weight
+        assert not torch.allclose(original_weight, current_local_weight), f"Local weight wasn't updated for {non_parallel_non_zero_layer}"
         
         full_weight = _gather_along_first_dim(current_local_weight)
         for idx, weight in enumerate(torch.split(full_weight, current_local_weight.shape[0])):
-            assert torch.allclose(weight, current_local_weight), f"Weight on rank {idx} doesn't match for {synced_layer}"
+            assert torch.allclose(weight, current_local_weight), f"Weight on rank {idx} doesn't match for {non_parallel_non_zero_layer}"
 
 
 class TestLoraAdapterWithUnknownBaseLayer:

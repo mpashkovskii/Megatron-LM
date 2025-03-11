@@ -12,7 +12,7 @@ class SyncedLinearAutograd(torch.autograd.Function):
         return input.mm(weight.t())
 
     @staticmethod
-    def setup_context(ctx, inputs: Tuple[torch.Tensor], output) -> None:
+    def setup_context(ctx, inputs: Tuple[torch.Tensor], output: torch.Tensor) -> None:
         input, weight = inputs
         ctx.save_for_backward(input, weight)
 
@@ -33,7 +33,7 @@ class SyncedLinearAutograd(torch.autograd.Function):
 
 class SyncedLinear(torch.nn.Module):
 
-    def __init__(self, input_size: int, output_size: int, init_method: callable, config: TransformerConfig, **kwargs) -> None:
+    def __init__(self, input_size: int, output_size: int, init_method: callable, config: TransformerConfig, broadcast_weights: bool = True, **kwargs) -> None:
         super().__init__()
         self.weight = torch.nn.Parameter(init_method(torch.empty(
             output_size,
@@ -41,8 +41,9 @@ class SyncedLinear(torch.nn.Module):
             device=torch.cuda.current_device(),
             dtype=config.params_dtype,
         )))
-        with torch.no_grad():
-            torch.distributed.broadcast(self.weight, src=0)
+        if broadcast_weights:
+            with torch.no_grad():
+                torch.distributed.broadcast(self.weight, src=0)
     
     def forward(self, input: torch.Tensor) -> Tuple[Union[torch.Tensor, None]]:
         return SyncedLinearAutograd.apply(input, self.weight), None
