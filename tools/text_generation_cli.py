@@ -11,9 +11,10 @@ if __name__ == "__main__":
 
     while True:
         sentence = input("Enter prompt: ")
+        temperature = float(eval(input("Temperature: ")))
         tokens_to_generate = int(eval(input("Enter number of tokens to generate: ")))
 
-        data = {"prompts": [sentence], "tokens_to_generate": tokens_to_generate}
+        data = {"prompts": [sentence], "tokens_to_generate": tokens_to_generate, "temperature": temperature}
         response = requests.put(url, data=json.dumps(data), headers=headers)
 
         if response.status_code != 200:

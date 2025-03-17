@@ -8,7 +8,6 @@
 
 import os
 import sys
-from functools import partial
 
 sys.path.append(
     os.path.abspath(
@@ -20,17 +19,24 @@ sys.path.append(
     )
 )
 
-import torch
 from argparse import ArgumentParser
+from functools import partial
 from typing import Callable
 
+import torch
+
+from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
+from megatron.core.datasets.gpt_dataset import GPTDataset
+from megatron.core.datasets.megatron_dataset import MegatronDataset
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.training import pretrain
+from megatron.training.global_vars import get_args
+from megatron.training.utils import print_rank_0
 
 # LoRA not neccesarily needed
-from lora_mixtral import add_lora_args, lora_model_provider
-from pretrain_gpt import SPIKY_LOSS_PERC, get_batch, train_valid_test_datasets_provider
+# from lora_mixtral import add_lora_args, lora_model_provider
+from pretrain_gpt import SPIKY_LOSS_PERC, core_gpt_dataset_config_from_args, get_batch, is_dataset_built_on_rank, model_provider
 
 
 # To be implemented
@@ -55,27 +61,59 @@ def forward_step(data_iterator, model: GPTModel) -> tuple[torch.Tensor, Callable
     return output_tensor, partial(grpo_loss_func, loss_mask)
 
 
+def train_valid_test_datasets_provider(train_val_test_num_samples: int) -> MegatronDataset:
+    """Build the train test and validation datasets.
+
+    Args:
+        train_val_test_num_samples : A list containing the number of samples in train test and validation.
+    """
+    args = get_args()
+    if args.mock_data:
+        raise NotImplementedError('Mock data is not supported')
+
+    config = core_gpt_dataset_config_from_args(args)
+
+    print_rank_0("> building train, validation, and test datasets for GPT ...")
+
+    train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
+        GPTDataset,
+        train_val_test_num_samples,
+        is_dataset_built_on_rank,
+        config
+    ).build()
+
+    print_rank_0("> finished creating GPT datasets ...")
+
+    print()
+    raise NotImplementedError('GRPO dataset provider is not implemented yet')
+
+    return train_ds, valid_ds, test_ds
+
+
 def add_grpo_args(parser: ArgumentParser) -> ArgumentParser:
     group = parser.add_argument_group(title='GRPO data preprocessing')
-    group.add_argument('--num-generations', type=int,
-                       help='Number of generations to sample. The global batch size'
+    group.add_argument('--num-generations', type=int, default=int(os.getenv("WORLD_SIZE", '8')),
+                       help='Number of generations to sample. The global batch size '
                             '(num_processes * per_device_batch_size)')
 
     group = parser.add_argument_group(title='GRPO training')
-    group.add_argument('--grpo-beta', type=float, help='beta scale for KL divergence')
+    group.add_argument('--grpo-beta', type=float, default=0,
+                       help='beta scale for KL divergence')
 
-    return add_lora_args(parser)
+    return parser
+    # return add_lora_args(parser)
 
 
 if __name__ == "__main__":
-    args = add_grpo_args(ArgumentParser()).parse_known_args()
-    if args.grpo_beta is not None:
+    args, _ = add_grpo_args(ArgumentParser()).parse_known_args()
+    if args.grpo_beta != 0:
         raise ValueError('GRPO beta is not supported yet')
 
     train_valid_test_datasets_provider.is_distributed = True
     pretrain(
         train_valid_test_datasets_provider,
-        lora_model_provider,
+        model_provider,
+        # lora_model_provider,
         ModelType.encoder_or_decoder,
         forward_step,
         extra_args_provider=add_grpo_args,
