@@ -96,6 +96,8 @@ class TestLoraAdapterWithLoraLayers:
             dropout=0.01,
         )
         yield
+        del self.base_layer
+        del self.lora_adapter
         Utils.destroy_model_parallel()
 
     def test_constructor(self) -> None:
@@ -141,10 +143,12 @@ class TestLoraAdapterWithLoraLayers:
         # To propagate gradients through the zero-initialized weights we need at least two iterations.
         # Let's do 10 to see errors accumulation.
         for _ in range(10):
+            # optimizer.zero_grad(set_to_none=True)
             optimizer.zero_grad()
-            output, _ = self.lora_adapter(input_data)
+            output, bias = self.lora_adapter(input_data)
             (1 - output.mean()).backward()
             optimizer.step()
+            del output, bias
 
         assert self.base_layer.weight.sum() == 0, "Base layer frozen weights were updated"
         assert torch.all(getattr(self.lora_adapter, parallel_zero_layer).weight), f"LoRA zero layer ({parallel_zero_layer}) weights weren't updated"
@@ -155,6 +159,12 @@ class TestLoraAdapterWithLoraLayers:
         full_weight = _gather_along_first_dim(current_local_weight)
         for idx, weight in enumerate(torch.split(full_weight, current_local_weight.shape[0])):
             assert torch.allclose(weight, current_local_weight), f"Weight on rank {idx} doesn't match for {non_parallel_non_zero_layer}"
+        
+        del input_data
+        del original_weight
+        del optimizer
+        del full_weight
+        torch.cuda.empty_cache()
 
 
 class TestLoraAdapterWithUnknownBaseLayer:
